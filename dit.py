@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 class PatchEmbed(nn.Module):
     def __init__(self, in_channels=4, hidden_dim=1024,
@@ -25,16 +26,25 @@ class PatchEmbed(nn.Module):
 
 
 class TimestepEmbedding(nn.Module):
-    def __init__(self, hidden_dim=1024):
+    def __init__(self, sinusoidal_dim, hidden_dim=1024):
         super().__init__()
-        # TODO: MLP that maps sinusoidal embedding -> hidden_dim
-        # sinusoidal dim is typically hidden_dim // 4 or 256
+        self.sinusoidal_dim = sinusoidal_dim
+        self.hidden_dim = hidden_dim
+        self.linear1 = nn.Linear(sinusoidal_dim, hidden_dim)
+        self.silu = nn.SiLU()
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.max_period = 10000
 
     def forward(self, t):
         # t: (B,) float tensor of timesteps in [0, 1]
         # TODO: sinusoidal embed -> MLP
         # return: (B, hidden_dim)
-        pass
+        half_dim = self.sinusoidal_dim // 2
+        freqs = torch.exp(-math.log(self.max_period) * torch.arange(half_dim, device=t.device, dtype=torch.float32))/half_dim
+        args = torch.outer(t, freqs) # (B, half_dim)
+        sincos = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return self.linear2(self.silu(self.linear1(sincos)))
+
 
 
 class DiTBlock(nn.Module):
