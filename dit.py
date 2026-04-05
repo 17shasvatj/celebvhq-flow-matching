@@ -37,7 +37,6 @@ class TimestepEmbedding(nn.Module):
 
     def forward(self, t):
         # t: (B,) float tensor of timesteps in [0, 1]
-        # TODO: sinusoidal embed -> MLP
         # return: (B, hidden_dim)
         half_dim = self.sinusoidal_dim // 2
         freqs = torch.exp(-math.log(self.max_period) * torch.arange(half_dim, device=t.device, dtype=torch.float32))/half_dim
