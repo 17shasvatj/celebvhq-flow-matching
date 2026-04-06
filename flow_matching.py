@@ -10,8 +10,11 @@ def train_step(model, x1, optimizer):
     t_expand = t[:, None, None, None, None]
     xt = (1-t_expand)*x0 + t_expand*x1
     v = x1 - x0
-    v_pred = model(xt, t)
-    loss = F.mse_loss(v_pred, v)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        v_pred = model(xt, t)
+        loss = F.mse_loss(v_pred, v)
+
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -31,6 +34,7 @@ def sample(model, shape, num_steps=50, device="cuda"):
     steps = torch.linspace(0, 1-dt, num_steps)
     for step in steps:
         t = torch.full((shape[0],), step, device=device)
-        v = model(x, t)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            v = model(x, t)
         x = x + v*dt
     return x
