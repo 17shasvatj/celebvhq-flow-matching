@@ -24,8 +24,12 @@ def sample(model, shape, num_steps=50, device="cuda"):
     Generate a video from pure noise.
     shape: (B, T, C, H, W)
     """
-    # TODO: start from x = randn(shape)
-    # TODO: create timesteps from 0 to 1 in num_steps
-    # TODO: for each step, predict velocity and advance x
     # return x
-    pass
+    x = torch.randn(shape, device=device)
+    dt = 1.0/num_steps
+    steps = torch.linspace(0, 1-dt, num_steps)
+    for step in steps:
+        t = torch.full((shape[0],), step, device=device)
+        v = model(x, t)
+        x = x + v*dt
+    return x
