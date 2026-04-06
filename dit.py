@@ -49,21 +49,35 @@ class TimestepEmbedding(nn.Module):
 class DiTBlock(nn.Module):
     def __init__(self, hidden_dim=1024, num_heads=16, mlp_ratio=4):
         super().__init__()
-        # TODO: two LayerNorms
-        # TODO: self-attention (nn.MultiheadAttention)
-        # TODO: MLP (hidden_dim -> hidden_dim*mlp_ratio -> hidden_dim)
-        # TODO: adaLN modulation: linear that maps conditioning -> 6 * hidden_dim
-        #       (shift1, scale1, gate1, shift2, scale2, gate2)
-        # NOTE: initialize the adaLN linear's weights to zero
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.linear1 = nn.Linear(hidden_dim, mlp_ratio*hidden_dim)
+        self.silu = nn.SiLU()
+        self.linear2 = nn.Linear(mlp_ratio*hidden_dim, hidden_dim)
+        self.adaln_linear = nn.Linear(hidden_dim, hidden_dim*6)
+        nn.init.zeros_(self.adaln_linear.weight)
+        nn.init.zeros_(self.adaln_linear.bias)
 
     def forward(self, x, c):
         # x: (B, num_tokens, hidden_dim)
         # c: (B, hidden_dim) — timestep conditioning
-        # TODO: get 6 modulation params from c
-        # TODO: norm -> modulate -> attention -> gate -> residual
-        # TODO: norm -> modulate -> MLP -> gate -> residual
         # return: (B, num_tokens, hidden_dim)
-        pass
+        mod_params = self.adaln_linear(c) # (B, hidden_dim*6)
+        shift1, scale1, gate1, shift2, scale2, gate2 = mod_params.unsqueeze(1).chunk(6, dim=-1)
+
+        # Attention
+        h = self.norm1(x) * (1+scale1) + shift1
+        h, _ = self.attention(h, h, h)
+        x = x + gate1 * h
+
+        # MLP
+        h = self.norm2(x) * (1+scale2) + shift2
+        h = self.linear2(self.silu(self.linear1(h)))
+        x = x + gate2*h
+
+        return x
+
 
 
 class FaceDiT(nn.Module):
