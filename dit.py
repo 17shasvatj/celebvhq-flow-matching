@@ -31,8 +31,10 @@ class TimestepEmbedding(nn.Module):
         self.sinusoidal_dim = sinusoidal_dim
         self.hidden_dim = hidden_dim
         self.linear1 = nn.Linear(sinusoidal_dim, hidden_dim)
-        self.silu = nn.SiLU()
+        self.silu1 = nn.SiLU()
         self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.silu2 = nn.SiLU()
+        self.linear3 = nn.Linear(hidden_dim, hidden_dim)
         self.max_period = 10000
 
     def forward(self, t):
@@ -44,7 +46,7 @@ class TimestepEmbedding(nn.Module):
         )
         args = torch.outer(t, freqs) # (B, half_dim)
         sincos = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        return self.linear2(self.silu(self.linear1(sincos)))
+        return self.linear3(self.silu2(self.linear2(self.silu1(self.linear1(sincos)))))
 
 
 
@@ -53,7 +55,17 @@ class DiTBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.attn_dropout = nn.Dropout(0.1)
+        self.mlp_dropout = nn.Dropout(0.1)
+
+        # Attention
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.qkv = nn.Linear(hidden_dim, hidden_dim*3)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        #self.attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+
+
         self.linear1 = nn.Linear(hidden_dim, mlp_ratio*hidden_dim)
         self.silu = nn.SiLU()
         self.linear2 = nn.Linear(mlp_ratio*hidden_dim, hidden_dim)
@@ -68,15 +80,23 @@ class DiTBlock(nn.Module):
         mod_params = self.adaln_linear(c) # (B, hidden_dim*6)
         shift1, scale1, gate1, shift2, scale2, gate2 = mod_params.unsqueeze(1).chunk(6, dim=-1)
 
-        # Attention
+
         h = self.norm1(x) * (1+scale1) + shift1
-        h, _ = self.attention(h, h, h)
-        x = x + gate1 * h
+
+        # Attention
+        B, N, D = h.shape
+        qkv = self.qkv(h).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # each (B, heads, N, head_dim)
+        h = torch.nn.functional.scaled_dot_product_attention(q, k, v)  # uses Flash Attention
+        h = h.transpose(1, 2).reshape(B, N, D)
+        h = self.out_proj(h)
+
+        x = x + gate1 * self.attn_dropout(h)
 
         # MLP
         h = self.norm2(x) * (1+scale2) + shift2
         h = self.linear2(self.silu(self.linear1(h)))
-        x = x + gate2*h
+        x = x + gate2*self.mlp_dropout(h)
 
         return x
 
