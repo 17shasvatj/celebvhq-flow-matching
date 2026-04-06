@@ -39,7 +39,9 @@ class TimestepEmbedding(nn.Module):
         # t: (B,) float tensor of timesteps in [0, 1]
         # return: (B, hidden_dim)
         half_dim = self.sinusoidal_dim // 2
-        freqs = torch.exp(-math.log(self.max_period) * torch.arange(half_dim, device=t.device, dtype=torch.float32))/half_dim
+        freqs = torch.exp(
+            -math.log(self.max_period) * torch.arange(half_dim, device=t.device, dtype=torch.float32) / half_dim
+        )
         args = torch.outer(t, freqs) # (B, half_dim)
         sincos = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return self.linear2(self.silu(self.linear1(sincos)))
@@ -85,18 +87,33 @@ class FaceDiT(nn.Module):
                  depth=20, mlp_ratio=4, patch_size=(2,2,2),
                  num_frames=16, latent_h=32, latent_w=32):
         super().__init__()
-        # TODO: PatchEmbed
-        # TODO: TimestepEmbedding
-        # TODO: nn.ModuleList of DiTBlocks
-        # TODO: final LayerNorm
-        # TODO: linear projection hidden_dim -> patch_dim (unpatchify)
+        self.num_frames = num_frames
+        self.patch_size = patch_size
+        self.latent_h = latent_h
+        self.latent_w = latent_w
+        self.in_channels = in_channels
+        self.patch_embed = PatchEmbed(in_channels, hidden_dim, patch_size, num_frames, latent_h, latent_w)
+        self.timestep_embedding = TimestepEmbedding(hidden_dim // 4, hidden_dim)
+        self.dit_blocks = nn.ModuleList([DiTBlock(hidden_dim, num_heads, mlp_ratio) for i in range(depth)])
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.linear = nn.Linear(hidden_dim, patch_size[0]*patch_size[1]*patch_size[2]*in_channels)
 
     def forward(self, x, t):
         # x: (B, T, C, H, W) noisy latent video
         # t: (B,) timesteps
-        # TODO: patch embed
-        # TODO: timestep embed
-        # TODO: run through all DiT blocks
-        # TODO: final norm + unpatchify back to (B, T, C, H, W)
         # return: predicted velocity, same shape as x
-        pass
+        patch_embedded = self.patch_embed(x) # (B, num_tokens, hidden_dim)
+        timestep_embedded = self.timestep_embedding(t)
+        h = patch_embedded
+        for block in self.dit_blocks:
+            h = block(h, timestep_embedded)
+        h = self.layer_norm(h)
+        h = self.linear(h) #(B, num_tokens, patch_t*patch_h*patch_w*in_ch)
+
+        h = h.reshape(h.shape[0], self.num_frames // self.patch_size[0], self.latent_h // self.patch_size[1],
+                      self.latent_w // self.patch_size[2], self.patch_size[0], self.patch_size[1],
+                      self.patch_size[2], self.in_channels)
+        h = h.permute(0, 1, 4, 7, 2, 5, 3, 6)
+        h = h.reshape(h.shape[0], self.num_frames, self.in_channels, self.latent_h, self.latent_w)
+        return h
+
