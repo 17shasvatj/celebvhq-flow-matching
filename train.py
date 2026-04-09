@@ -50,8 +50,9 @@ def train(config):
         loaded = 0
         skipped = 0
         for k, v in pretrained.items():
-            if k in model_dict and model_dict[k].shape == v.shape:
-                model_dict[k] = v
+            clean_key = k.replace("_orig_mod.", "")
+            if clean_key in model_dict and model_dict[clean_key].shape == v.shape:
+                model_dict[clean_key] = v
                 loaded += 1
             else:
                 skipped += 1
