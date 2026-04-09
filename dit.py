@@ -105,7 +105,7 @@ class DiTBlock(nn.Module):
 class FaceDiT(nn.Module):
     def __init__(self, in_channels=4, hidden_dim=1024, num_heads=16,
                  depth=20, mlp_ratio=4, patch_size=(2,2,2),
-                 num_frames=16, latent_h=32, latent_w=32):
+                 num_frames=16, latent_h=32, latent_w=32, num_emotions = 8, cond_dropout=0.1):
         super().__init__()
         self.num_frames = num_frames
         self.patch_size = patch_size
@@ -118,15 +118,31 @@ class FaceDiT(nn.Module):
         self.layer_norm = nn.LayerNorm(hidden_dim)
         self.linear = nn.Linear(hidden_dim, patch_size[0]*patch_size[1]*patch_size[2]*in_channels)
 
-    def forward(self, x, t):
+        # Emotion conditioning
+        self.num_emotions = num_emotions
+        self.cond_dropout = cond_dropout
+        self.emotion_embedding = nn.Embedding(num_emotions, hidden_dim)
+        self.emotion_proj = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+    def forward(self, x, t, emotion=None):
         # x: (B, T, C, H, W) noisy latent video
         # t: (B,) timesteps
         # return: predicted velocity, same shape as x
         patch_embedded = self.patch_embed(x) # (B, num_tokens, hidden_dim)
-        timestep_embedded = self.timestep_embedding(t)
+        c = self.timestep_embedding(t)
+
+        if emotion is not None:
+            emotion_emb = self.emotion_embedding(emotion)
+            emotion_emb = self.emotion_proj(emotion_emb)
+
+            # CFG dropout
+            if self.training and self.cond_dropout > 0:
+                mask = torch.rand(emotion.shape[0], 1, device=emotion.device) > self.cond_dropout
+                emotion_emb = emotion_emb * mask.float()
+
+            c = c + emotion_emb
         h = patch_embedded
         for block in self.dit_blocks:
-            h = block(h, timestep_embedded)
+            h = block(h, c)
         h = self.layer_norm(h)
         h = self.linear(h) #(B, num_tokens, patch_t*patch_h*patch_w*in_ch)
 
