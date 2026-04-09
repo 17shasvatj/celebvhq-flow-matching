@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-def train_step(model, x1, optimizer):
+def train_step(model, x1, emotion, optimizer):
     """
     x1: clean latent video batch, (B, T, C, H, W)
     """
@@ -12,7 +12,7 @@ def train_step(model, x1, optimizer):
     v = x1 - x0
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        v_pred = model(xt, t)
+        v_pred = model(xt, t, emotion=emotion)
         loss = F.mse_loss(v_pred, v)
 
     optimizer.zero_grad()
@@ -23,7 +23,7 @@ def train_step(model, x1, optimizer):
 
 
 @torch.no_grad()
-def sample(model, shape, num_steps=50, device="cuda"):
+def sample(model, shape, num_steps=50, device="cuda", emotion=None, cfg_scale=1.0):
     """
     Generate a video from pure noise.
     shape: (B, T, C, H, W)
@@ -35,6 +35,11 @@ def sample(model, shape, num_steps=50, device="cuda"):
     for step in steps:
         t = torch.full((shape[0],), step, device=device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            v = model(x, t)
+            if cfg_scale > 1.0 and emotion is not None:
+                v_cond = model(x, t, emotion=emotion) # conditional
+                v_uncond = model(x, t, emotion=None) # unconditional
+                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+            else:
+                v = model(x, t, emotion)
         x = x + v*dt
     return x
