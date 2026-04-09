@@ -35,10 +35,28 @@ def train(config):
         hidden_dim=config["hidden_dim"],
         depth=config["depth"],
         num_heads=config["num_heads"],
+        num_emotions=8,
+        cond_dropout=config["cond_dropout"],
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {total_params:,} params ({total_params/1e6:.1f}M)")
+
+    # ── Load pretrained unconditional weights ──
+    if config["resume_weights"] and os.path.exists(config["resume_weights"]):
+        print(f"Loading pretrained weights from {config['resume_weights']}...")
+        pretrained = torch.load(config["resume_weights"], weights_only=True)
+        model_dict = model.state_dict()
+        loaded = 0
+        skipped = 0
+        for k, v in pretrained.items():
+            if k in model_dict and model_dict[k].shape == v.shape:
+                model_dict[k] = v
+                loaded += 1
+            else:
+                skipped += 1
+        model.load_state_dict(model_dict)
+        print(f"  Loaded {loaded} params, skipped {skipped} (new conditioning layers)")
 
     model = torch.compile(model)
 
@@ -117,8 +135,9 @@ def train(config):
 
         for batch_idx, (latents, emotion_idx) in enumerate(train_loader):
             latents = latents.to(device)
+            emotion_idx = emotion_idx.to(device)
 
-            loss = train_step(model, latents, optimizer)
+            loss = train_step(model, latents, emotion_idx, optimizer)
 
             scheduler.step()
 
@@ -155,6 +174,7 @@ def train(config):
             with torch.no_grad():
                 for latents, emotion_idx in val_loader:
                     latents = latents.to(device)
+                    emotion_idx = emotion_idx.to(device)
                     x1 = latents
                     x0 = torch.randn_like(x1)
                     t = torch.rand(x1.shape[0], device=device)
@@ -162,7 +182,7 @@ def train(config):
                     xt = (1 - t_expand) * x0 + t_expand * x1
                     v = x1 - x0
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        v_pred = model(xt, t)
+                        v_pred = model(xt, t, emotion=emotion_idx)
                         loss = torch.nn.functional.mse_loss(v_pred, v)
                     val_loss += loss.item()
                     val_batches += 1
@@ -207,10 +227,13 @@ def train(config):
                 orig_weights[name] = param.data.clone()
                 param.data.copy_(ema_weights[name])
 
+            sample_emotions = torch.arange(4, device=device)
             samples = sample(
                 model,
                 shape=(4, 16, 4, 32, 32),
+                emotion=sample_emotions,
                 num_steps=50,
+                cfg_scale=config["cfg_scale"],
                 device=device,
             )
             torch.save(
@@ -245,6 +268,9 @@ if __name__ == "__main__":
     parser.add_argument("--val_every", type=int, default=5)
     parser.add_argument("--sample_every", type=int, default=20)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--cond_dropout", type=float, default=0.1)
+    parser.add_argument("--cfg_scale", type=float, default=3.0)
+    parser.add_argument("--resume_weights", type=str, default="")
     args = parser.parse_args()
 
     config = vars(args)
