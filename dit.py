@@ -105,24 +105,34 @@ class DiTBlock(nn.Module):
 class FaceDiT(nn.Module):
     def __init__(self, in_channels=4, hidden_dim=1024, num_heads=16,
                  depth=20, mlp_ratio=4, patch_size=(2,2,2),
-                 num_frames=16, latent_h=32, latent_w=32, num_emotions = 8, cond_dropout=0.1):
+                 num_frames=16, latent_h=32, latent_w=32, clip_dim = 512, num_emotions = 8, cond_dropout=0.1,
+                 clip_embeddings_path=None):
         super().__init__()
         self.num_frames = num_frames
         self.patch_size = patch_size
         self.latent_h = latent_h
         self.latent_w = latent_w
         self.in_channels = in_channels
+        self.cond_dropout = cond_dropout
+        self.num_emotions = num_emotions
+
         self.patch_embed = PatchEmbed(in_channels, hidden_dim, patch_size, num_frames, latent_h, latent_w)
         self.timestep_embedding = TimestepEmbedding(hidden_dim // 4, hidden_dim)
+
+        # CLIP based emotion conditioning
+        clip_embs = torch.load(clip_embeddings_path, weights_only=True)
+        self.register_buffer("clip_embeddings", clip_embs)
+        # Learnable projection from CLIP space to hidden_dim
+        self.emotion_proj = nn.Sequential(
+            nn.Linear(clip_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
         self.dit_blocks = nn.ModuleList([DiTBlock(hidden_dim, num_heads, mlp_ratio) for i in range(depth)])
         self.layer_norm = nn.LayerNorm(hidden_dim)
         self.linear = nn.Linear(hidden_dim, patch_size[0]*patch_size[1]*patch_size[2]*in_channels)
 
-        # Emotion conditioning
-        self.num_emotions = num_emotions
-        self.cond_dropout = cond_dropout
-        self.emotion_embedding = nn.Embedding(num_emotions, hidden_dim)
-        self.emotion_proj = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
     def forward(self, x, t, emotion=None):
         # x: (B, T, C, H, W) noisy latent video
         # t: (B,) timesteps
@@ -131,8 +141,8 @@ class FaceDiT(nn.Module):
         c = self.timestep_embedding(t)
 
         if emotion is not None:
-            emotion_emb = self.emotion_embedding(emotion)
-            emotion_emb = self.emotion_proj(emotion_emb)
+            clip_emb = self.clip_embeddings[emotion]
+            emotion_emb = self.emotion_proj(clip_emb)
 
             # CFG dropout
             if self.training and self.cond_dropout > 0:
