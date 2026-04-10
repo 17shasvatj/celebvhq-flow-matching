@@ -1,30 +1,62 @@
 """
-train.py — Training loop for FaceDiT.
+train.py — Training loop for FaceDiT with CLIP emotion conditioning.
 
 Usage:
-    python train.py --data_path /workspace/celebvhq_latents.pt --output_dir /workspace/checkpoints
+    python train.py --data_path /workspace/celebvhq_latents.pt \
+                    --output_dir /workspace/checkpoints_clip \
+                    --resume_weights /workspace/checkpoints/best_ema.pt \
+                    --clip_embeddings_path /workspace/clip_emotion_embeddings.pt \
+                    --batch_size 32 --lr 3e-5 --num_epochs 150
 
 Features:
-    - bf16 mixed precision
-    - torch.compile
-    - EMA weights
-    - Learning rate warmup
-    - Gradient clipping
-    - Checkpointing with resume support
-    - Periodic sample generation
+    - CLIP-based emotion conditioning (frozen pretrained embeddings)
+    - Sqrt-balanced sampling
+    - Horizontal flip augmentation
+    - Multi-CFG sampling (1.0, 1.5, 2.0)
+    - Higher cond_dropout (0.15) for better unconditional path
+    - bf16 mixed precision + torch.compile
+    - EMA weights + gradient clipping
 """
 
 import argparse
 import os
 import time
 import json
+import math
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dit import FaceDiT
 from dataset import FaceVideoDataset
 from flow_matching import train_step, sample
+
+EMOTIONS = ["neutral", "happy", "sad", "surprise", "fear", "disgust", "anger", "contempt"]
+
+
+def make_sqrt_balanced_sampler(dataset):
+    """
+    Sqrt-balanced sampling: sample proportional to 1/sqrt(class_frequency).
+    """
+    counts = {}
+    for i in range(len(dataset)):
+        _, emo = dataset[i]
+        emo = int(emo)
+        counts[emo] = counts.get(emo, 0) + 1
+
+    print("Emotion distribution:")
+    for emo_idx in sorted(counts.keys()):
+        name = EMOTIONS[emo_idx] if emo_idx < len(EMOTIONS) else str(emo_idx)
+        print(f"  {name}: {counts[emo_idx]}")
+
+    weights = []
+    for i in range(len(dataset)):
+        _, emo = dataset[i]
+        emo = int(emo)
+        w = 1.0 / math.sqrt(counts[emo])
+        weights.append(w)
+
+    return WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True)
 
 
 def train(config):
@@ -35,8 +67,10 @@ def train(config):
         hidden_dim=config["hidden_dim"],
         depth=config["depth"],
         num_heads=config["num_heads"],
+        clip_dim=512,
         num_emotions=8,
         cond_dropout=config["cond_dropout"],
+        clip_embeddings_path=config["clip_embeddings_path"],
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -78,10 +112,12 @@ def train(config):
     train_dataset = FaceVideoDataset(config["data_path"], split="train")
     val_dataset = FaceVideoDataset(config["data_path"], split="val")
 
+    sampler = make_sqrt_balanced_sampler(train_dataset)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
-        shuffle=True,
+        sampler=sampler,
         num_workers=4,
         pin_memory=True,
         drop_last=True,
@@ -98,6 +134,7 @@ def train(config):
 
     print(f"Train: {len(train_dataset)} clips, {len(train_loader)} batches/epoch")
     print(f"Val:   {len(val_dataset)} clips")
+    print(f"Cond dropout: {config['cond_dropout']}, LR: {config['lr']}")
 
     # ── EMA ──
     ema_weights = {}
@@ -123,7 +160,6 @@ def train(config):
 
     os.makedirs(config["output_dir"], exist_ok=True)
 
-    # Save config
     with open(os.path.join(config["output_dir"], "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
@@ -151,7 +187,6 @@ def train(config):
             num_batches += 1
             global_step += 1
 
-            # Log
             if global_step % config["log_every"] == 0:
                 avg_loss = epoch_loss / num_batches
                 lr = optimizer.param_groups[0]["lr"]
@@ -218,7 +253,7 @@ def train(config):
             )
             print(f"  Saved checkpoint at epoch {epoch}")
 
-        # ── Generate samples ──
+        # ── Generate samples at multiple CFG scales ──
         if (epoch + 1) % config["sample_every"] == 0:
             model.eval()
 
@@ -228,20 +263,26 @@ def train(config):
                 orig_weights[name] = param.data.clone()
                 param.data.copy_(ema_weights[name])
 
-            sample_emotions = torch.arange(4, device=device)
-            samples = sample(
-                model,
-                shape=(4, 16, 4, 32, 32),
-                emotion=sample_emotions,
-                num_steps=50,
-                cfg_scale=config["cfg_scale"],
-                device=device,
-            )
-            torch.save(
-                samples,
-                os.path.join(config["output_dir"], f"samples_epoch{epoch:04d}.pt"),
-            )
-            print(f"  Saved samples at epoch {epoch}")
+            # Generate all 8 emotions at CFG 1.0, 1.5, 2.0
+            for cfg in [1.0, 1.5, 2.0]:
+                for batch_start in [0, 4]:
+                    sample_emotions = torch.arange(batch_start, batch_start + 4, device=device)
+                    samples = sample(
+                        model,
+                        shape=(4, 16, 4, 32, 32),
+                        emotion=sample_emotions,
+                        num_steps=50,
+                        cfg_scale=cfg,
+                        device=device,
+                    )
+                    torch.save(
+                        samples,
+                        os.path.join(config["output_dir"],
+                                     f"samples_epoch{epoch:04d}_cfg{cfg:.1f}_emo{batch_start}-{batch_start+3}.pt"),
+                    )
+                emo_names_0 = [EMOTIONS[i] for i in range(0, 4)]
+                emo_names_1 = [EMOTIONS[i] for i in range(4, 8)]
+                print(f"  Saved samples at epoch {epoch}, CFG {cfg} ({emo_names_0 + emo_names_1})")
 
             # Restore training weights
             for name, param in model.named_parameters():
@@ -255,23 +296,23 @@ def train(config):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_clip")
     parser.add_argument("--hidden_dim", type=int, default=1024)
     parser.add_argument("--depth", type=int, default=20)
     parser.add_argument("--num_heads", type=int, default=16)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num_epochs", type=int, default=200)
-    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--num_epochs", type=int, default=150)
+    parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--val_every", type=int, default=5)
-    parser.add_argument("--sample_every", type=int, default=20)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--cond_dropout", type=float, default=0.1)
-    parser.add_argument("--cfg_scale", type=float, default=3.0)
+    parser.add_argument("--sample_every", type=int, default=15)
+    parser.add_argument("--cond_dropout", type=float, default=0.15)
+    parser.add_argument("--clip_embeddings_path", type=str, default="./clip_emotion_embeddings.pt")
     parser.add_argument("--resume_weights", type=str, default="")
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     config = vars(args)
