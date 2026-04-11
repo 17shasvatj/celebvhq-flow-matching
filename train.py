@@ -11,7 +11,6 @@ Usage:
 Features:
     - CLIP-based emotion conditioning (frozen pretrained embeddings)
     - Sqrt-balanced sampling
-    - Horizontal flip augmentation
     - Multi-CFG sampling (1.0, 1.5, 2.0)
     - Higher cond_dropout (0.15) for better unconditional path
     - bf16 mixed precision + torch.compile

@@ -5,8 +5,6 @@ def train_step(model, x1, emotion, optimizer):
     x1: clean latent video batch, (B, T, C, H, W)
     """
     # return loss value
-    if torch.rand(1).item() > 0.5:
-        x1 = x1.flip(-1)
     x0 = torch.randn_like(x1)
     t = torch.rand((x1.shape[0], ), device=x1.device)
     t_expand = t[:, None, None, None, None]
