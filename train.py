@@ -24,9 +24,9 @@ import math
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from dit_final import FaceDiT
+from dit import FaceDiT
 from dataset import FaceVideoDataset
-from flow_matching_final import train_step, sample
+from flow_matching import train_step, sample
 
 EMOTIONS = ["neutral", "happy", "sad", "surprise", "fear", "disgust", "anger", "contempt"]
 
