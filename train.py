@@ -1,12 +1,18 @@
 """
-train.py — Fine-tune FaceDiT with null token for proper CFG.
+train_final.py — Train FaceDiT with learned label embeddings + null token.
+
+Exactly matches DiT's approach:
+- nn.Embedding(num_classes + 1, hidden_dim) for class conditioning
+- Null token at index num_classes, trained from epoch 0
+- CFG dropout replaces labels with null token index
+
+Start from unconditional pretrained weights.
 
 Usage:
-    python train.py --data_path /workspace/celebvhq_latents.pt \
-                    --output_dir /workspace/checkpoints_nulltok \
-                    --resume_weights /workspace/checkpoints_clip/best_ema.pt \
-                    --clip_embeddings_path /workspace/clip_emotion_embeddings.pt \
-                    --batch_size 32 --lr 1e-5 --num_epochs 50
+    python train_final.py --data_path /workspace/celebvhq_latents.pt \
+                          --output_dir /workspace/checkpoints_final \
+                          --resume_weights /workspace/checkpoints/best_ema.pt \
+                          --batch_size 32 --lr 3e-5 --num_epochs 150
 """
 
 import argparse
@@ -18,9 +24,9 @@ import math
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from dit import FaceDiT
+from dit_final import FaceDiT
 from dataset import FaceVideoDataset
-from flow_matching import train_step, sample
+from flow_matching_final import train_step, sample
 
 EMOTIONS = ["neutral", "happy", "sad", "surprise", "fear", "disgust", "anger", "contempt"]
 
@@ -54,22 +60,22 @@ def train(config):
         hidden_dim=config["hidden_dim"],
         depth=config["depth"],
         num_heads=config["num_heads"],
-        clip_dim=512,
-        num_emotions=8,
+        num_classes=config["num_classes"],
         cond_dropout=config["cond_dropout"],
-        clip_embeddings_path=config["clip_embeddings_path"],
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {total_params:,} params ({total_params/1e6:.1f}M)")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model: {total_params:,} params ({total_params/1e6:.1f}M), {trainable_params:,} trainable")
 
-    # Load pretrained CLIP-conditioned weights
+    # Load unconditional pretrained weights
     if config["resume_weights"] and os.path.exists(config["resume_weights"]):
         print(f"Loading pretrained weights from {config['resume_weights']}...")
         pretrained = torch.load(config["resume_weights"], weights_only=True)
         model_dict = model.state_dict()
         loaded = 0
         skipped = 0
+        skipped_keys = []
         for k, v in pretrained.items():
             clean_key = k.replace("_orig_mod.", "")
             if clean_key in model_dict and model_dict[clean_key].shape == v.shape:
@@ -77,8 +83,13 @@ def train(config):
                 loaded += 1
             else:
                 skipped += 1
+                skipped_keys.append(clean_key)
         model.load_state_dict(model_dict)
         print(f"  Loaded {loaded} params, skipped {skipped}")
+        if skipped_keys:
+            print(f"  Skipped keys: {skipped_keys[:10]}{'...' if len(skipped_keys) > 10 else ''}")
+    else:
+        print("No pretrained weights loaded — training from scratch")
 
     model = torch.compile(model)
 
@@ -120,20 +131,22 @@ def train(config):
     print(f"Train: {len(train_dataset)} clips, {len(train_loader)} batches/epoch")
     print(f"Val:   {len(val_dataset)} clips")
     print(f"Cond dropout: {config['cond_dropout']}, LR: {config['lr']}")
-    print(f"Null token enabled at index 8")
+    print(f"Null token at index {config['num_classes']} (DiT-style)")
+    print(f"No CLIP, no projection MLP — pure nn.Embedding")
 
     # EMA
     ema_weights = {}
     for name, param in model.named_parameters():
         ema_weights[name] = param.data.clone()
 
-    # Resume
+    # Resume from checkpoint
     start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
     ckpt_path = os.path.join(config["output_dir"], "latest.pt")
 
     if os.path.exists(ckpt_path) and config["resume"]:
+        print(f"Resuming from {ckpt_path}...")
         ckpt = torch.load(ckpt_path, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -142,12 +155,18 @@ def train(config):
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["global_step"]
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        print(f"Resumed from epoch {start_epoch}, step {global_step}")
+        print(f"  Resumed from epoch {start_epoch}, step {global_step}, best val {best_val_loss:.4f}")
 
     os.makedirs(config["output_dir"], exist_ok=True)
 
     with open(os.path.join(config["output_dir"], "config.json"), "w") as f:
         json.dump(config, f, indent=2)
+
+    # CSV loss log
+    loss_csv_path = os.path.join(config["output_dir"], "losses.csv")
+    if not os.path.exists(loss_csv_path) or start_epoch == 0:
+        with open(loss_csv_path, "w") as f:
+            f.write("epoch,train_loss,val_loss,best_val_loss,lr\n")
 
     for epoch in range(start_epoch, config["num_epochs"]):
         model.train()
@@ -218,7 +237,17 @@ def train(config):
                 )
                 print(f"  New best! Saved best_ema.pt")
 
+            # Write to CSV
+            with open(loss_csv_path, "a") as f:
+                lr = optimizer.param_groups[0]["lr"]
+                f.write(f"{epoch},{epoch_loss:.6f},{val_loss:.6f},{best_val_loss:.6f},{lr:.2e}\n")
+
             model.train()
+        else:
+            # Write to CSV (no val this epoch)
+            with open(loss_csv_path, "a") as f:
+                lr = optimizer.param_groups[0]["lr"]
+                f.write(f"{epoch},{epoch_loss:.6f},,{best_val_loss:.6f},{lr:.2e}\n")
 
         # Checkpoint
         if (epoch + 1) % config["save_every"] == 0:
@@ -237,16 +266,17 @@ def train(config):
             )
             print(f"  Saved checkpoint at epoch {epoch}")
 
-        # Generate samples at multiple CFG scales
+        # Generate samples
         if (epoch + 1) % config["sample_every"] == 0:
             model.eval()
 
+            # Swap to EMA weights for sampling
             orig_weights = {}
             for name, param in model.named_parameters():
                 orig_weights[name] = param.data.clone()
                 param.data.copy_(ema_weights[name])
 
-            for cfg in [1.5, 2.0, 3.0, 4.0]:
+            for cfg in [1.0, 1.5, 2.0, 3.0, 4.0]:
                 for batch_start in [0, 4]:
                     sample_emotions = torch.arange(batch_start, batch_start + 4, device=device)
                     samples = sample(
@@ -264,6 +294,7 @@ def train(config):
                     )
                 print(f"  Saved samples at epoch {epoch}, CFG {cfg}")
 
+            # Restore training weights
             for name, param in model.named_parameters():
                 param.data.copy_(orig_weights[name])
 
@@ -275,21 +306,21 @@ def train(config):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_nulltok")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_final")
     parser.add_argument("--hidden_dim", type=int, default=1024)
     parser.add_argument("--depth", type=int, default=20)
     parser.add_argument("--num_heads", type=int, default=16)
+    parser.add_argument("--num_classes", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--num_epochs", type=int, default=50)
-    parser.add_argument("--warmup_steps", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--num_epochs", type=int, default=150)
+    parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--log_every", type=int, default=50)
-    parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument("--save_every", type=int, default=5)
     parser.add_argument("--val_every", type=int, default=5)
     parser.add_argument("--sample_every", type=int, default=10)
-    parser.add_argument("--cond_dropout", type=float, default=0.15)
-    parser.add_argument("--clip_embeddings_path", type=str, default="./clip_emotion_embeddings.pt")
+    parser.add_argument("--cond_dropout", type=float, default=0.1)
     parser.add_argument("--resume_weights", type=str, default="")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()

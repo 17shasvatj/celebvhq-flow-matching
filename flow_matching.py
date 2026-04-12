@@ -1,13 +1,12 @@
 import torch
 import torch.nn.functional as F
 
-NULL_TOKEN = 8
 
 def train_step(model, x1, emotion, optimizer):
     """
     x1: clean latent video batch, (B, T, C, H, W)
     emotion: (B,) int emotion labels (0-7)
-    Note: CFG dropout (replacing with null token) is handled inside model.forward()
+    CFG dropout is handled inside model.forward() via LabelEmbedder.token_drop()
     """
     x0 = torch.randn_like(x1)
     t = torch.rand((x1.shape[0],), device=x1.device)
@@ -29,7 +28,7 @@ def train_step(model, x1, emotion, optimizer):
 @torch.no_grad()
 def sample(model, shape, emotion, num_steps=50, cfg_scale=1.0, device="cuda"):
     """
-    Generate a video from pure noise using single-model CFG with null token.
+    Generate a video using single-model CFG with null token.
     shape: (B, T, C, H, W)
     emotion: (B,) int emotion labels (0-7)
     cfg_scale: guidance scale. 1.0 = no guidance.
@@ -37,19 +36,27 @@ def sample(model, shape, emotion, num_steps=50, cfg_scale=1.0, device="cuda"):
     x = torch.randn(shape, device=device)
     dt = 1.0 / num_steps
     steps = torch.linspace(0, 1 - dt, num_steps)
+    B = shape[0]
 
-    # Null token for unconditional path
-    null_emotion = torch.full((shape[0],), NULL_TOKEN, device=device, dtype=torch.long)
+    # Null token index = num_classes (8 for our model)
+    # Handle torch.compile wrapper (_orig_mod) and DataParallel (module)
+    if hasattr(model, '_orig_mod'):
+        nc = model._orig_mod.num_classes
+    elif hasattr(model, 'module'):
+        nc = model.module.num_classes
+    else:
+        nc = model.num_classes
+    null_labels = torch.full((B,), nc, device=device, dtype=torch.long)
 
     use_cfg = cfg_scale > 1.0
 
     for step in steps:
-        t = torch.full((shape[0],), step, device=device)
+        t = torch.full((B,), step, device=device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             if use_cfg:
-                # Both paths go through the SAME model, SAME pathway
+                # Both go through the SAME model, SAME pathway
                 v_cond = model(x, t, emotion=emotion)
-                v_uncond = model(x, t, emotion=null_emotion)
+                v_uncond = model(x, t, emotion=null_labels)
                 v = v_uncond + cfg_scale * (v_cond - v_uncond)
             else:
                 v = model(x, t, emotion=emotion)

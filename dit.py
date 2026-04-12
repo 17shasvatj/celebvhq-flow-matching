@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 
+
 class PatchEmbed(nn.Module):
     def __init__(self, in_channels=4, hidden_dim=1024,
                  patch_size=(2, 2, 2), num_frames=16, latent_h=32, latent_w=32):
@@ -11,7 +12,7 @@ class PatchEmbed(nn.Module):
                               hidden_dim,
                               kernel_size=patch_size,
                               stride=patch_size)
-        self.num_tokens = (num_frames // patch_size[0]) * (latent_h // patch_size[1]) * (latent_w //patch_size[2])
+        self.num_tokens = (num_frames // patch_size[0]) * (latent_h // patch_size[1]) * (latent_w // patch_size[2])
         self.pos_emb = nn.Parameter(torch.zeros(1, self.num_tokens, hidden_dim))
 
     def forward(self, x):
@@ -43,6 +44,43 @@ class TimestepEmbedding(nn.Module):
         return self.linear3(self.silu2(self.linear2(self.silu1(self.linear1(sincos)))))
 
 
+class LabelEmbedder(nn.Module):
+    """
+    Embeds class labels into vector representations.
+    Handles label dropout for classifier-free guidance.
+    Exactly matches DiT's LabelEmbedder implementation.
+    """
+    def __init__(self, num_classes, hidden_size, dropout_prob):
+        super().__init__()
+        use_cfg_embedding = dropout_prob > 0
+        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
+        self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
+
+    def token_drop(self, labels):
+        """
+        Drops labels to enable classifier-free guidance.
+        Replaces dropped labels with num_classes (the null class index).
+        """
+        drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        labels = torch.where(drop_ids, self.num_classes, labels)
+        return labels
+
+    def forward(self, labels, train):
+        """
+        Args:
+            labels: (B,) integer class labels, 0 to num_classes-1
+            train: bool, whether in training mode
+        Returns:
+            (B, hidden_size) embedding vectors
+        """
+        use_dropout = self.dropout_prob > 0
+        if train and use_dropout:
+            labels = self.token_drop(labels)
+        embeddings = self.embedding_table(labels)
+        return embeddings
+
+
 class DiTBlock(nn.Module):
     def __init__(self, hidden_dim=1024, num_heads=16, mlp_ratio=4):
         super().__init__()
@@ -53,13 +91,13 @@ class DiTBlock(nn.Module):
 
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.qkv = nn.Linear(hidden_dim, hidden_dim*3)
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
 
-        self.linear1 = nn.Linear(hidden_dim, mlp_ratio*hidden_dim)
+        self.linear1 = nn.Linear(hidden_dim, mlp_ratio * hidden_dim)
         self.silu = nn.SiLU()
-        self.linear2 = nn.Linear(mlp_ratio*hidden_dim, hidden_dim)
-        self.adaln_linear = nn.Linear(hidden_dim, hidden_dim*6)
+        self.linear2 = nn.Linear(mlp_ratio * hidden_dim, hidden_dim)
+        self.adaln_linear = nn.Linear(hidden_dim, hidden_dim * 6)
         nn.init.zeros_(self.adaln_linear.weight)
         nn.init.zeros_(self.adaln_linear.bias)
 
@@ -67,7 +105,7 @@ class DiTBlock(nn.Module):
         mod_params = self.adaln_linear(c)
         shift1, scale1, gate1, shift2, scale2, gate2 = mod_params.unsqueeze(1).chunk(6, dim=-1)
 
-        h = self.norm1(x) * (1+scale1) + shift1
+        h = self.norm1(x) * (1 + scale1) + shift1
 
         B, N, D = h.shape
         qkv = self.qkv(h).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -78,78 +116,51 @@ class DiTBlock(nn.Module):
 
         x = x + gate1 * self.attn_dropout(h)
 
-        h = self.norm2(x) * (1+scale2) + shift2
+        h = self.norm2(x) * (1 + scale2) + shift2
         h = self.linear2(self.silu(self.linear1(h)))
-        x = x + gate2*self.mlp_dropout(h)
+        x = x + gate2 * self.mlp_dropout(h)
 
         return x
 
 
 class FaceDiT(nn.Module):
     def __init__(self, in_channels=4, hidden_dim=1024, num_heads=16,
-                 depth=20, mlp_ratio=4, patch_size=(2,2,2),
+                 depth=20, mlp_ratio=4, patch_size=(2, 2, 2),
                  num_frames=16, latent_h=32, latent_w=32,
-                 clip_dim=512, num_emotions=8, cond_dropout=0.15,
-                 clip_embeddings_path=None):
+                 num_classes=8, cond_dropout=0.15):
         super().__init__()
         self.num_frames = num_frames
         self.patch_size = patch_size
         self.latent_h = latent_h
         self.latent_w = latent_w
         self.in_channels = in_channels
-        self.cond_dropout = cond_dropout
-        self.num_emotions = num_emotions
-        self.null_token_idx = num_emotions  # index 8 = null token
+        self.num_classes = num_classes
 
         self.patch_embed = PatchEmbed(in_channels, hidden_dim, patch_size, num_frames, latent_h, latent_w)
         self.timestep_embedding = TimestepEmbedding(hidden_dim // 4, hidden_dim)
 
-        # CLIP-based emotion conditioning with null token
-        if clip_embeddings_path is not None:
-            clip_embs = torch.load(clip_embeddings_path, weights_only=True)  # (8, 512)
-        else:
-            clip_embs = torch.randn(num_emotions, clip_dim)
+        # Label embedder: exactly like DiT
+        # num_classes + 1 entries: 0-7 = emotions, 8 = null (unconditional)
+        self.label_embedder = LabelEmbedder(num_classes, hidden_dim, cond_dropout)
 
-        # Append null token: mean of all emotion embeddings as starting point
-        null_emb = clip_embs.mean(dim=0, keepdim=True)  # (1, 512)
-        clip_embs_with_null = torch.cat([clip_embs, null_emb], dim=0)  # (9, 512)
-        self.register_buffer("clip_embeddings", clip_embs_with_null)
-
-        # Learnable projection from CLIP space to hidden_dim
-        self.emotion_proj = nn.Sequential(
-            nn.Linear(clip_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        self.dit_blocks = nn.ModuleList([DiTBlock(hidden_dim, num_heads, mlp_ratio) for i in range(depth)])
+        self.dit_blocks = nn.ModuleList([DiTBlock(hidden_dim, num_heads, mlp_ratio) for _ in range(depth)])
         self.layer_norm = nn.LayerNorm(hidden_dim)
-        self.linear = nn.Linear(hidden_dim, patch_size[0]*patch_size[1]*patch_size[2]*in_channels)
+        self.linear = nn.Linear(hidden_dim, patch_size[0] * patch_size[1] * patch_size[2] * in_channels)
 
     def forward(self, x, t, emotion):
-        # x: (B, T, C, H, W) noisy latent video
-        # t: (B,) timesteps
-        # emotion: (B,) int emotion labels (0-7 = emotions, 8 = null/unconditional)
-        # return: predicted velocity, same shape as x
-
+        """
+        x: (B, T, C, H, W) noisy latent video
+        t: (B,) timesteps
+        emotion: (B,) integer emotion labels (0-7)
+        """
         patch_embedded = self.patch_embed(x)
-        c = self.timestep_embedding(t)
+        t_emb = self.timestep_embedding(t)
 
-        # Always go through the same conditioning pathway
-        clip_emb = self.clip_embeddings[emotion]  # (B, 512)
-        emotion_emb = self.emotion_proj(clip_emb)  # (B, hidden_dim)
+        # Label embedding with CFG dropout (replaces with null class during training)
+        y_emb = self.label_embedder(emotion, self.training)
 
-        # CFG dropout: replace with null token during training
-        if self.training and self.cond_dropout > 0:
-            mask = torch.rand(emotion.shape[0], device=emotion.device) < self.cond_dropout
-            emotion = emotion.clone()
-            emotion[mask] = self.null_token_idx
-
-            # Recompute embedding for masked samples
-            clip_emb = self.clip_embeddings[emotion]
-            emotion_emb = self.emotion_proj(clip_emb)
-
-        c = c + emotion_emb
+        # Combine timestep + label conditioning
+        c = t_emb + y_emb
 
         h = patch_embedded
         for block in self.dit_blocks:
