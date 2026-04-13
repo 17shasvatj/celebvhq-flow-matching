@@ -5,6 +5,8 @@ Trained an unconditional latent flow matching model from scratch to generate 16 
 Used a 381M parameter video Diffusion Transformer with 20 layers and 16 attention heads as the backbone. Trained with rectified flow matching. 
 For sampling used Euler ODE solver with 50 steps. It was latent flow matching, so the pretrained Stable Diffusion VAE was used to encode 256x256x3 frames into 32x32x4 latent resolution (and decode them after).
 
+For conditional training we conditioned on the emotion class with 10% CFG dropout. Samples were generated with a CFG value of 4.0.
+
 ## Generated samples (epoch 159, unconditional)
 
 | | | | |
