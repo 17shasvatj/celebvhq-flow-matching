@@ -14,17 +14,17 @@ For sampling used Euler ODE solver with 50 steps. It was latent flow matching, s
 
 ## Generated samples (epoch 150, conditional training)
 
-Happy
-| ![](assets/happy.gif) |
+## Happy
+ ![](assets/happy.gif) 
 
-Anger
-| ![](assets/anger.gif) |
+## Anger
+ ![](assets/anger.gif) 
 
-Surprise
-| ![](assets/surprise1.gif) |  ![](assets/surprise2.gif) |
+## Surprise
+ ![](assets/surprise1.gif)   ![](assets/surprise2.gif) 
 
-Disgust
-| ![](assets/disgust.gif) |
+## Disgust
+ ![](assets/disgust.gif) 
 
 ## Training Curve
 
