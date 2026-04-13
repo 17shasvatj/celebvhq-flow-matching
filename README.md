@@ -26,6 +26,6 @@ For sampling used Euler ODE solver with 50 steps. It was latent flow matching, s
 ## Disgust
  ![](assets/disgust.gif) 
 
-## Training Curve
+## Training Curve (Unconditional)
 
-| ![](assets/training_curve.png)|
+ ![](assets/training_curve.png)
