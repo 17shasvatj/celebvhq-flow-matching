@@ -21,7 +21,7 @@ For sampling used Euler ODE solver with 50 steps. It was latent flow matching, s
  ![](assets/anger.gif) 
 
 ## Surprise
- ![](assets/surprise1.gif)   ![](assets/surprise2.gif) 
+ ![](assets/surprise1.gif)
 
 ## Disgust
  ![](assets/disgust.gif) 
